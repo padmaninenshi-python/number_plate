@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PlateVision v5</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet">
+    <style>
+        .plate-type-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
+        .badge-white  { background: #e8e8e8; color: #333; border: 1px solid #ccc; }
+        .badge-yellow { background: #FFD700; color: #333; border: 1px solid #c8a800; }
+        .corner-info  {
+            font-size: 0.82rem;
+            padding: 6px 12px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        .corner-quad  { background: #d4edda; color: #155724; }
+        .corner-bbox  { background: #fff3cd; color: #856404; }
+        .v5-badge     { font-size: 0.7rem; background: #059669; color: #fff; padding: 2px 7px; border-radius: 10px; vertical-align: middle; margin-left: 4px; }
+        .angle-badge  { font-size: 0.7rem; background: #2563eb; color: #fff; padding: 2px 7px; border-radius: 10px; vertical-align: middle; margin-left: 4px; }
+    </style>
+</head>
+<body>
+<div class="shell">
+
+    <header>
+        <span class="logo">🚘 PlateVision <span class="v2">v4</span><span class="v5-badge">Multi-Fix</span></span>
+        <span class="badge">Auto-fit sticker · Any angle · Like Spinny &amp; Car24</span>
+    </header>
+
+    <!-- Mode selector -->
+    <div class="mode-bar">
+        <span class="mode-label">Output Mode:</span>
+        <div class="mode-group">
+            <button class="mode-btn active" data-mode="logo" onclick="setMode('logo')">
+                🔒 Logo Replace
+            </button>
+            <button class="mode-btn" data-mode="border" onclick="setMode('border')">
+                🔲 Border Only
+            </button>
+        </div>
+    </div>
+    <p class="mode-desc" id="modeDesc">
+        <strong>Logo Replace:</strong> Covers plate with Caryanams logo sticker — perspective-warped to match exact plate angle. Aspect-ratio is auto-corrected for side-angle shots so the sticker always fits perfectly.
+    </p>
+
+    <div class="tabs">
+        <button class="tab active" id="tab-camera" onclick="switchTab('camera')">📷 Camera</button>
+        <button class="tab" id="tab-upload" onclick="switchTab('upload')">🖼️ Upload</button>
+    </div>
+
+    <!-- Camera -->
+    <div class="panel" id="panel-camera">
+        <div class="video-box">
+            <video id="videoEl" autoplay playsinline muted></video>
+            <div class="scan" id="scanLine"></div>
+            <div class="placeholder" id="placeholder"><div>📷</div><p>Click Start Camera</p></div>
+        </div>
+        <div class="controls">
+            <button class="btn g" id="btnStart" onclick="startCamera()">▶ Start Camera</button>
+            <button class="btn o" id="btnCapture" onclick="captureFrame()" disabled>📸 Capture</button>
+            <button class="btn r" id="btnStop" onclick="stopCamera()" disabled>⏹ Stop</button>
+        </div>
+    </div>
+
+    <!-- Upload -->
+    <div class="panel hidden" id="panel-upload">
+        <div class="drop" id="dropzone" onclick="document.getElementById('fi').click()">
+            <input type="file" id="fi" accept="image/*" onchange="handleFile(event)" hidden>
+            <div style="font-size:2.5rem">🖼️</div>
+            <p>Drop image or <u>click to browse</u></p>
+            <p class="drop-hint">Any angle · Front &amp; side shots · White &amp; yellow plates</p>
+        </div>
+        <div class="preview hidden" id="uploadPreview">
+            <img id="uploadImg" src="" alt="">
+            <button class="btn o full" onclick="detectFromUpload()">🔍 Detect &amp; Process Plate</button>
+        </div>
+    </div>
+
+    <!-- Loading -->
+    <div class="loading hidden" id="loading">
+        <div class="spin"></div>
+        <p>Detecting plate &amp; computing angle-corrected fit…</p>
+    </div>
+
+    <!-- Result -->
+    <div class="result hidden" id="result">
+
+        <div class="plate-display">
+            <div class="plate-label">DETECTED PLATE</div>
+            <div class="plate-number" id="plateNumber">—</div>
+            <div class="plate-hello" id="plateHello"></div>
+        </div>
+
+        <div class="corner-info" id="cornerInfo"></div>
+
+        <img class="result-img" id="resultImg" src="" alt="Result">
+
+        <a class="btn o full" id="dlBtn" download="plate_v4.png">⬇ Download HD Image</a>
+        <button class="btn grey full" onclick="resetAll()">↩ Try Another</button>
+
+    </div>
+
+</div>
+<canvas id="canvas" hidden></canvas>
+<script src="/static/js/main.js"></script>
+<script>
+// Override showResult to also show angle-correction info
+const _origShowResult = typeof showResult === 'function' ? showResult : null;
+
+// Patch cornerInfo display to include aspect correction info
+function patchCornerInfo(data) {
+    const ci = document.getElementById('cornerInfo');
+    if (!ci) return;
+    let html = '';
+    if (data.perspective_quad) {
+        html += '<span class="corner-info corner-quad">✅ Perspective quad detected</span> ';
+    } else {
+        html += '<span class="corner-info corner-bbox">⚠️ Bounding box fallback</span> ';
+    }
+    if (data.aspect_corrected) {
+        html += `<span class="angle-badge">📐 Angle corrected (ratio ${data.detected_aspect}→3.33)</span>`;
+    }
+    ci.innerHTML = html;
+}
+
+// Hook into fetch response — patch the existing main.js flow
+const _origFetch = window.fetch.bind(window);
+window.fetch = function(url, opts) {
+    return _origFetch(url, opts).then(async resp => {
+        if (url === '/detect') {
+            const clone = resp.clone();
+            clone.json().then(d => {
+                if (d && typeof d === 'object') {
+                    setTimeout(() => patchCornerInfo(d), 100);
+                }
+            });
+        }
+        return resp;
+    });
+};
+
+document.querySelectorAll('.mode-btn').forEach(b => {
+    b.addEventListener('click', () => {
+        const desc = {
+            logo: '<strong>Logo Replace:</strong> Covers plate with Caryanams logo sticker — perspective-warped to match exact plate angle. Aspect-ratio is auto-corrected for side-angle shots.',
+            border: '<strong>Border Only:</strong> Draws a perspective-accurate border around the detected plate quad — plate stays visible.'
+        };
+        document.getElementById('modeDesc').innerHTML = desc[b.dataset.mode] || '';
+    });
+});
+</script>
+</body>
+</html>

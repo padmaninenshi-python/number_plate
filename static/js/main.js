@@ -33,6 +33,7 @@ async function startCamera() {
 }
 
 function stopCamera() {
+    unfreezeCamera();
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     const v = document.getElementById('videoEl'); v.srcObject = null;
     document.getElementById('placeholder').classList.remove('hidden');
@@ -44,7 +45,28 @@ function captureFrame() {
     const v = document.getElementById('videoEl'), c = document.getElementById('canvas');
     c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+
+    // Freeze: pause video and show canvas as frozen preview
+    v.pause();
+    c.style.display = 'block';
+    c.style.position = 'absolute';
+    c.style.top = '0'; c.style.left = '0';
+    c.style.width = '100%'; c.style.height = '100%';
+    c.style.objectFit = 'cover';
+    c.style.borderRadius = v.style.borderRadius || '0';
+    c.style.zIndex = '10';
+
+    // Disable capture button while processing
+    dis('btnCapture', true);
+
     send(c.toDataURL('image/jpeg', 0.98));
+}
+
+function unfreezeCamera() {
+    const v = document.getElementById('videoEl'), c = document.getElementById('canvas');
+    c.style.display = 'none';
+    if (stream) v.play();
+    dis('btnCapture', false);
 }
 
 function handleFile(e) {
@@ -85,9 +107,10 @@ async function send(imageData) {
         });
         const d = await res.json();
         hide('loading');
+        unfreezeCamera();
         if (d.error) { alert('Error: ' + d.error + '\n\n' + (d.trace||'')); return; }
         showResult(d);
-    } catch(e) { hide('loading'); alert('Network error: ' + e.message); }
+    } catch(e) { hide('loading'); unfreezeCamera(); alert('Network error: ' + e.message); }
 }
 
 function showResult(d) {

@@ -30,14 +30,14 @@ PLATE_STD_ASPECT  = 3.33
 PLATE_HSRP_ASPECT = 4.17
 PLATE_MIN_ASPECT  = 1.8
 
-QUAD_MIN_ASPECT = 1.4
-QUAD_MAX_ASPECT = 7.0
+QUAD_MIN_ASPECT = 1.0
+QUAD_MAX_ASPECT = 9.0
 
 PAD_W_FRAC = 0.05
 PAD_H_FRAC = 0.10
 
 # Max outward expansion allowed when growing bbox (fraction of original bbox size)
-GROW_MAX_FRAC = 0.60   # can grow up to 60% outward on each side
+GROW_MAX_FRAC = 0.80   # can grow up to 80% outward on each side (needed for angled plates)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -386,9 +386,9 @@ def _minAreaRect_quad(crop, cx1, cy1, bbox_area):
     gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     blurred = cv2.GaussianBlur(clahe.apply(gray), (5, 5), 0)
-    edges   = cv2.Canny(blurred, 20, 100)
+    edges   = cv2.Canny(blurred, 15, 80)   # lower thresholds for angled plates
     k       = np.ones((3, 3), np.uint8)
-    edges   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
+    edges   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=3)
 
     pts = cv2.findNonZero(edges)
     if pts is None or len(pts) < 20:
@@ -401,6 +401,19 @@ def _minAreaRect_quad(crop, cx1, cy1, bbox_area):
     ordered = _order_corners(box)
     if _is_valid_plate_quad(ordered, bbox_area):
         return ordered
+
+    # Fallback: try minAreaRect on ALL contour points combined (better for angled plates)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        all_pts = np.vstack([c.reshape(-1,2) for c in cnts if cv2.contourArea(c) > 20])
+        if len(all_pts) >= 4:
+            rect2 = cv2.minAreaRect(all_pts)
+            box2  = cv2.boxPoints(rect2).astype(np.float32)
+            box2[:, 0] += cx1
+            box2[:, 1] += cy1
+            ordered2 = _order_corners(box2)
+            if _is_valid_plate_quad(ordered2, bbox_area):
+                return ordered2
     return None
 
 
@@ -476,14 +489,20 @@ def _aspect_correct_corners(corners, bbox_w, bbox_h):
     """
     For foreshortened (side-angle) plates: rescale quad height to match
     standard plate aspect ratio along the plate's tilt axis.
+
+    FIX: Always attempt correction based on detected quad aspect ratio,
+    NOT bbox_aspect. Angled plates have large bbox_aspect but compressed
+    quad height — old check was incorrectly skipping correction.
     """
-    bbox_aspect = bbox_w / bbox_h if bbox_h > 0 else 99.0
-    if bbox_aspect >= PLATE_MIN_ASPECT:
+    plate_w, plate_h = _compute_plate_dims(corners)
+    if plate_h < 1 or plate_w < 1:
         return corners
 
-    plate_w, plate_h = _compute_plate_dims(corners)
-    if plate_h < 1:
-        return corners
+    detected_aspect = plate_w / plate_h
+    # Only correct when detected aspect is significantly below standard
+    # (means plate height is visually compressed due to angle)
+    if detected_aspect >= PLATE_STD_ASPECT * 0.75:
+        return corners  # quad already looks correct, no correction needed
 
     target_h  = plate_w / PLATE_STD_ASPECT
     scale     = target_h / plate_h

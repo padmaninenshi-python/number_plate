@@ -46,20 +46,26 @@ function captureFrame() {
     c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
 
-    // Freeze: pause video and overlay canvas exactly over the video element
+    // Freeze: hide video (keep space), place canvas inside same video-box
+    v.style.visibility = 'hidden';
     v.pause();
-    const rect = v.getBoundingClientRect();
-    c.style.position = 'fixed';
-    c.style.left     = rect.left + 'px';
-    c.style.top      = rect.top  + 'px';
-    c.style.width    = rect.width  + 'px';
-    c.style.height   = rect.height + 'px';
-    c.style.objectFit = 'cover';
-    c.style.zIndex   = '9999';
-    c.style.display  = 'block';
-    c.style.margin   = '0';
-    c.style.padding  = '0';
+
+    const box = v.parentElement; // .video-box
+    box.style.position = 'relative'; // ensure relative
+
+    c.style.position   = 'absolute';
+    c.style.top        = v.offsetTop  + 'px';
+    c.style.left       = v.offsetLeft + 'px';
+    c.style.width      = v.offsetWidth  + 'px';
+    c.style.height     = v.offsetHeight + 'px';
+    c.style.objectFit  = 'cover';
+    c.style.zIndex     = '10';
+    c.style.display    = 'block';
+    c.style.margin     = '0';
+    c.style.padding    = '0';
     c.style.borderRadius = getComputedStyle(v).borderRadius;
+
+    box.appendChild(c); // move canvas inside video-box
 
     dis('btnCapture', true);
     send(c.toDataURL('image/jpeg', 0.98));
@@ -68,6 +74,7 @@ function captureFrame() {
 function unfreezeCamera() {
     const v = document.getElementById('videoEl'), c = document.getElementById('canvas');
     c.style.display = 'none';
+    v.style.visibility = 'visible';
     if (stream) v.play();
     dis('btnCapture', false);
 }
@@ -123,7 +130,6 @@ function showResult(d) {
     const plate = d.plate_text || '—';
     document.getElementById('plateNumber').textContent = plate;
 
-    // Plate type badge
     const colorLabel = d.plate_color === 'yellow'
         ? '<span class="plate-type-badge badge-yellow">🟡 Yellow / Rear</span>'
         : '<span class="plate-type-badge badge-white">⬜ White / Front</span>';
@@ -137,7 +143,6 @@ function showResult(d) {
             ? `✅ ${plate}  •  ${modeBadge}${confBadge}${enhBadge} ${colorLabel}`
             : `${d.message}  •  ${modeBadge}${confBadge}${enhBadge} ${colorLabel}`;
 
-    // Corner detection info
     const ci = document.getElementById('cornerInfo');
     if (d.perspective_quad) {
         ci.textContent = '✅ Perspective quad fitted — logo perfectly matches plate angle';

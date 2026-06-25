@@ -46,19 +46,22 @@ function captureFrame() {
     c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
 
-    // Freeze: pause video and show canvas as frozen preview
+    // Freeze: pause video and overlay canvas exactly over the video element
     v.pause();
-    c.style.display = 'block';
-    c.style.position = 'absolute';
-    c.style.top = '0'; c.style.left = '0';
-    c.style.width = '100%'; c.style.height = '100%';
+    const rect = v.getBoundingClientRect();
+    c.style.position = 'fixed';
+    c.style.left     = rect.left + 'px';
+    c.style.top      = rect.top  + 'px';
+    c.style.width    = rect.width  + 'px';
+    c.style.height   = rect.height + 'px';
     c.style.objectFit = 'cover';
-    c.style.borderRadius = v.style.borderRadius || '0';
-    c.style.zIndex = '10';
+    c.style.zIndex   = '9999';
+    c.style.display  = 'block';
+    c.style.margin   = '0';
+    c.style.padding  = '0';
+    c.style.borderRadius = getComputedStyle(v).borderRadius;
 
-    // Disable capture button while processing
     dis('btnCapture', true);
-
     send(c.toDataURL('image/jpeg', 0.98));
 }
 

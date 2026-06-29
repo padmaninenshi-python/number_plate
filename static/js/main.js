@@ -52,19 +52,33 @@ async function startCamera() {
 
 function stopCamera() {
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-    const v = document.getElementById('videoEl'); v.srcObject = null;
+    const v = document.getElementById('videoEl');
+    v.pause(); v.srcObject = null;
     document.getElementById('placeholder').classList.remove('hidden');
     document.getElementById('scanLine').classList.remove('active');
     dis('btnStart', false); dis('btnStop', true);
-    cameraActive = false;           // ← lock
+    cameraActive = false;
     _updateCaptureLock();
 }
 
+function resumeCamera() {
+    const v = document.getElementById('videoEl');
+    if (stream && v.paused) {
+        v.play();
+        document.getElementById('scanLine').classList.add('active');
+    }
+}
+
 function captureFrame() {
-    if (!cameraActive) return;      // ← extra guard
+    if (!cameraActive) return;      // extra guard
     const v = document.getElementById('videoEl'), c = document.getElementById('canvas');
     c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+
+    // Freeze video on captured frame
+    v.pause();
+    document.getElementById('scanLine').classList.remove('active');
+
     send(c.toDataURL('image/jpeg', 0.98));
 }
 
@@ -159,6 +173,7 @@ function resetAll() {
     document.getElementById('uploadPreview').classList.add('hidden');
     document.getElementById('dropzone').style.display = '';
     document.getElementById('fi').value = '';
+    resumeCamera();   // unfreeze video after Try Another
 }
 
 function show(id) { document.getElementById(id).classList.remove('hidden'); }

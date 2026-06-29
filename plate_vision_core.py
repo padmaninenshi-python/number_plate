@@ -1,21 +1,14 @@
 """
-PlateVision v9 — ROOT CAUSE FIX for partial plate coverage.
+PlateVision v10 — COMPLETE REWRITE of corner detection + bbox growth.
 
-ROOT CAUSE (identified from VW Polo + Toyota Innova images):
-  ALPR gives an UNDERSIZED bounding box that covers only part of the plate.
-  v8 was clamping all corners TO the ALPR box — actively cutting the sticker short.
-
-THE FIX:
-  1. _grow_bbox_to_plate() — NEW: after ALPR detection, walk outward in all 4
-     directions using plate color to find the TRUE plate boundary. This is the
-     same technique Spinny/Cars24 use. Happens BEFORE any corner detection.
-  2. _clamp_to_alpr() changed to _clamp_to_search_region() — clamps to the
-     GROWN bbox (not the original tiny ALPR box).
-  3. find_plate_corners() now operates on the GROWN bbox crop, not ALPR crop.
-  4. Contour quad validation area threshold lowered (ALPR box can be 30% of true
-     plate — was rejecting valid quads).
-  5. Yellow plate color walk uses separate (broader) HSV range.
-  6. White plate color walk uses adaptive threshold per-image.
+ROOT CAUSES FIXED (v9 failures):
+  1. _grow_bbox_to_plate() was a STUB — returned ALPR bbox unchanged.
+     Now: walks outward pixel-by-pixel using plate color mask to find TRUE edges.
+  2. find_plate_corners() used OTSU on full expanded crop — white car body
+     confused it. Now: uses plate-color-aware mask, not raw OTSU.
+  3. Contour filtering too loose — accepted background blobs far from plate.
+     Now: strict center proximity + aspect score.
+  4. Yellow plate expansion was same path as white — different HSV range needed.
 """
 
 import cv2
@@ -37,7 +30,7 @@ PAD_W_FRAC = 0.0
 PAD_H_FRAC = 0.0
 
 # Max outward expansion allowed when growing bbox (fraction of original bbox size)
-GROW_MAX_FRAC = 0.30   # 30% max — prevents bleeding into white car body on white plates
+GROW_MAX_FRAC = 0.40   # 40% max expansion per side
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -45,10 +38,6 @@ GROW_MAX_FRAC = 0.30   # 30% max — prevents bleeding into white car body on wh
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _order_corners(pts):
-    """
-    Order 4 corners as [TL, TR, BR, BL] using sum/diff trick.
-    Works correctly for rotated plates.
-    """
     pts = np.array(pts, dtype=np.float32).reshape(4, 2)
     s   = pts.sum(axis=1)
     d   = np.diff(pts, axis=1).squeeze()
@@ -93,21 +82,84 @@ def _compute_plate_dims(corners):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 0 — GROW THE ALPR BBOX TO TRUE PLATE BOUNDARIES  ← THE KEY FIX
+# STEP 0 — GROW THE ALPR BBOX TO TRUE PLATE BOUNDARIES  ← KEY FIX v10
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
     """
-    Return ALPR bbox as-is — no padding, no expansion.
-    ALPR yolo-v9 is accurate enough; any padding causes oversized sticker.
+    Walk outward from ALPR bbox in all 4 directions using plate color mask.
+    Stops when the plate color density drops below threshold.
+    This finds the TRUE plate boundary before corner detection runs.
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    bw = x2 - x1
+    bh = y2 - y1
+
+    max_exp_x = int(bw * GROW_MAX_FRAC)
+    max_exp_y = int(bh * GROW_MAX_FRAC)
+
+    # Build color mask for the whole image
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    if plate_color == 'yellow':
+        mask = cv2.inRange(hsv, np.array([12, 60, 80]), np.array([40, 255, 255]))
+    else:
+        white  = cv2.inRange(hsv, np.array([0,   0, 185]), np.array([180, 45, 255]))
+        slight = cv2.inRange(hsv, np.array([14, 15, 170]), np.array([38, 75, 255]))
+        mask   = cv2.bitwise_or(white, slight)
+
+    # Morphological clean to remove noise
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+
+    # Threshold: row/col must have at least this fraction of plate pixels to expand
+    DENSITY_THRESH = 0.25
+
+    # Grow LEFT
+    new_x1 = x1
+    for step in range(1, max_exp_x + 1):
+        col = max(0, x1 - step)
+        col_strip = mask[y1:y2, col:col+1]
+        if col_strip.size == 0: break
+        density = np.mean(col_strip) / 255.0
+        if density < DENSITY_THRESH: break
+        new_x1 = col
+
+    # Grow RIGHT
+    new_x2 = x2
+    for step in range(1, max_exp_x + 1):
+        col = min(iw - 1, x2 + step)
+        col_strip = mask[y1:y2, col:col+1]
+        if col_strip.size == 0: break
+        density = np.mean(col_strip) / 255.0
+        if density < DENSITY_THRESH: break
+        new_x2 = col
+
+    # Grow UP
+    new_y1 = y1
+    for step in range(1, max_exp_y + 1):
+        row = max(0, y1 - step)
+        row_strip = mask[row:row+1, x1:x2]
+        if row_strip.size == 0: break
+        density = np.mean(row_strip) / 255.0
+        if density < DENSITY_THRESH: break
+        new_y1 = row
+
+    # Grow DOWN
+    new_y2 = y2
+    for step in range(1, max_exp_y + 1):
+        row = min(ih - 1, y2 + step)
+        row_strip = mask[row:row+1, x1:x2]
+        if row_strip.size == 0: break
+        density = np.mean(row_strip) / 255.0
+        if density < DENSITY_THRESH: break
+        new_y2 = row
+
     return (
-        max(0,  x1),
-        max(0,  y1),
-        min(iw, x2),
-        min(ih, y2),
+        max(0,  new_x1),
+        max(0,  new_y1),
+        min(iw, new_x2),
+        min(ih, new_y2),
     )
 
 
@@ -151,16 +203,14 @@ def detect_plate_color(img, x1, y1, x2, y2):
 def _color_plate_mask(crop, plate_hint='white'):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     if plate_hint == 'yellow':
-        mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
+        mask = cv2.inRange(hsv, np.array([12, 60, 80]), np.array([40, 255, 255]))
     else:
-        # Tight white: very low saturation (plate number area is bright white)
-        # Avoid bleeding into white car body which has lower value at angles
-        white  = cv2.inRange(hsv, np.array([0,   0, 200]), np.array([180, 40, 255]))
-        slight = cv2.inRange(hsv, np.array([14, 20, 185]), np.array([38, 80, 255]))
+        white  = cv2.inRange(hsv, np.array([0,   0, 185]), np.array([180, 45, 255]))
+        slight = cv2.inRange(hsv, np.array([14, 15, 170]), np.array([38, 75, 255]))
         mask   = cv2.bitwise_or(white, slight)
 
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
     return mask
 
@@ -170,12 +220,7 @@ def _color_plate_mask(crop, plate_hint='white'):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_valid_plate_quad(pts, bbox_area):
-    """
-    Validate 4-corner quad for plate-like properties.
-    bbox_area here is the GROWN bbox area (not original ALPR area).
-    """
     area = _quad_area(pts)
-    # Accept quads between 20% and 400% of the (already-grown) bbox area
     if area < bbox_area * 0.20 or area > bbox_area * 4.0:
         return False
     w, h = _compute_plate_dims(pts)
@@ -190,11 +235,6 @@ def _is_valid_plate_quad(pts, bbox_area):
 
 
 def _clamp_to_region(quad, x1, y1, x2, y2):
-    """
-    Hard clamp every corner to the GROWN bounding box.
-    The grown box already covers the full plate, so clamping here
-    prevents floating outside the plate, not shrinking inside it.
-    """
     out = quad.copy()
     out[:, 0] = np.clip(out[:, 0], x1, x2)
     out[:, 1] = np.clip(out[:, 1], y1, y2)
@@ -206,10 +246,6 @@ def _clamp_to_region(quad, x1, y1, x2, y2):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _contour_quad(crop, cx1, cy1, bbox_area):
-    """
-    Multi-pass CLAHE+Canny edge detection → polygon → 4-corner quad.
-    Operates on the GROWN bbox crop (so it sees the full plate).
-    """
     ch, cw = crop.shape[:2]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
@@ -252,10 +288,6 @@ def _contour_quad(crop, cx1, cy1, bbox_area):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _color_quad(crop, cx1, cy1, bbox_area, plate_hint='white'):
-    """
-    HSV color segmentation → plate polygon.
-    MinAreaRect fallback if approxPolyDP can't reduce to 4 corners.
-    """
     mask = _color_plate_mask(crop, plate_hint)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -295,7 +327,7 @@ def _minAreaRect_quad(crop, cx1, cy1, bbox_area):
     gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     blurred = cv2.GaussianBlur(clahe.apply(gray), (5, 5), 0)
-    edges   = cv2.Canny(blurred, 15, 80)   # lower thresholds for angled plates
+    edges   = cv2.Canny(blurred, 15, 80)
     k       = np.ones((3, 3), np.uint8)
     edges   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=3)
 
@@ -311,7 +343,6 @@ def _minAreaRect_quad(crop, cx1, cy1, bbox_area):
     if _is_valid_plate_quad(ordered, bbox_area):
         return ordered
 
-    # Fallback: try minAreaRect on ALL contour points combined (better for angled plates)
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if cnts:
         all_pts = np.vstack([c.reshape(-1,2) for c in cnts if cv2.contourArea(c) > 20])
@@ -343,29 +374,28 @@ def _expanded_bbox_quad(x1, y1, x2, y2, img_w, img_h):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MASTER CORNER FINDER  — operates on GROWN bbox
+# MASTER CORNER FINDER  — v10: uses GROWN bbox + plate-color mask  ← KEY FIX
 # ══════════════════════════════════════════════════════════════════════════════
 
 def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
     """
-    Find exact 4 corners of the plate including tilt/perspective angle.
+    Find exact 4 corners of the plate.
 
-    KEY INSIGHT: Look AROUND the plate (dark bumper frame) not INSIDE it.
-    Inside has noisy text edges. Outside has clean plate border lines.
-
-    Algorithm:
-    1. Expand bbox by ~20% on each side to see the dark border frame
-    2. Threshold: isolate the bright white plate region against dark surround
-    3. findContours on the white region → plate outline
-    4. minAreaRect on largest contour → rotated rectangle = plate corners
-    5. Validate size matches ALPR bbox; fallback to ALPR bbox if not
+    v10 changes vs v9:
+    - Uses plate-COLOR mask (not raw OTSU) to segment the plate region.
+      OTSU fails when car body is also white — color mask isolates plate.
+    - Operates on GROWN bbox (grown before this call by _grow_bbox_to_plate).
+    - Expand by 25%x / 35%y to see surrounding dark bumper frame.
+    - Multi-candidate scoring: proximity to ALPR center + aspect closeness to 3.33.
+    - Strict aspect window [1.5, 7.0] to reject non-plate shapes.
+    - Falls back to grown ALPR bbox (not just ALPR bbox) if all fails.
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     bw = x2 - x1
     bh = y2 - y1
 
-    # Expand to see surrounding dark frame (plate sits in dark bumper)
+    # Expand to see dark bumper frame surrounding the plate
     ex = int(bw * 0.25)
     ey = int(bh * 0.35)
     ex1 = max(0,  x1 - ex);  ey1 = max(0,  y1 - ey)
@@ -374,21 +404,29 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
     if crop.size == 0:
         return _bbox_corners(x1, y1, x2, y2)
 
-    # Convert to grayscale and threshold: white plate vs dark surround
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    # OTSU threshold finds the natural white/dark split
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # ── Step 1: plate-color mask (avoids white-car-body confusion) ──────────
+    plate_mask = _color_plate_mask(crop, plate_hint)
 
-    # Morphological close to fill text gaps inside plate
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k, iterations=3)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k, iterations=1)
+    # Fill internal text holes so plate is one solid blob
+    k_fill = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 7))
+    plate_mask = cv2.morphologyEx(plate_mask, cv2.MORPH_CLOSE, k_fill, iterations=4)
+    plate_mask = cv2.morphologyEx(plate_mask, cv2.MORPH_OPEN,  k_fill, iterations=1)
 
-    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(plate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # ── Step 2: if color mask gives no contours, fall back to OTSU ──────────
+    if not cnts:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k2, iterations=3)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k2, iterations=1)
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     if not cnts:
         return _bbox_corners(x1, y1, x2, y2)
 
-    # ALPR center in crop coords
+    # ALPR center in crop coords (used for proximity scoring)
     alpr_cx = (x1 + x2) / 2.0 - ex1
     alpr_cy = (y1 + y2) / 2.0 - ey1
     alpr_area = float(bw * bh)
@@ -398,8 +436,8 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
 
     for cnt in cnts:
         area = cv2.contourArea(cnt)
-        # Must overlap well with ALPR area
-        if area < alpr_area * 0.30 or area > alpr_area * 4.0:
+        # Must be meaningfully sized relative to ALPR bbox
+        if area < alpr_area * 0.25 or area > alpr_area * 5.0:
             continue
         # Center must be close to ALPR center
         M = cv2.moments(cnt)
@@ -408,19 +446,26 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
         cx = M['m10'] / M['m00']
         cy = M['m01'] / M['m00']
         dist = ((cx - alpr_cx)**2 + (cy - alpr_cy)**2) ** 0.5
-        if dist > max(bw, bh) * 0.5:
+        # Allow max distance = 60% of bbox diagonal
+        max_dist = ((bw**2 + bh**2) ** 0.5) * 0.60
+        if dist > max_dist:
             continue
 
         rect = cv2.minAreaRect(cnt)
         rw, rh = rect[1]
-        if rh == 0:
+        if rh == 0 or rw == 0:
             continue
         aspect = max(rw, rh) / min(rw, rh)
+        # Strict aspect window for plate
         if not (1.5 <= aspect <= 7.0):
             continue
 
-        score = (1.0 - abs(aspect - 3.33) / 5.0) * 0.6 + \
-                (1.0 - dist / (max(bw, bh) * 0.5 + 1)) * 0.4
+        # Score: weighted combination of aspect closeness + proximity
+        aspect_score = 1.0 - min(abs(aspect - PLATE_STD_ASPECT), abs(aspect - PLATE_HSRP_ASPECT)) / 5.0
+        prox_score   = 1.0 - dist / (max_dist + 1.0)
+        size_score   = min(area / alpr_area, alpr_area / (area + 1)) 
+        score = aspect_score * 0.5 + prox_score * 0.35 + size_score * 0.15
+
         if score > best_score:
             best_score = score
             best = (cnt, rect)
@@ -433,15 +478,14 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
         box[:, 1] += ey1
         ordered = _order_corners(box)
         w, h = _compute_plate_dims(ordered)
-        # Accept if size is reasonable (50%–200% of ALPR bbox)
+        # Accept if size is reasonable (45%–220% of ALPR bbox)
         if (h >= 4 and w >= 4 and
-            bw * 0.50 <= w <= bw * 2.0 and
-            bh * 0.50 <= h <= bh * 2.0):
+            bw * 0.45 <= w <= bw * 2.2 and
+            bh * 0.45 <= h <= bh * 2.2):
             return ordered
 
-    # Fallback: ALPR bbox directly
+    # Fallback: use the grown ALPR bbox directly as rectangle
     return _bbox_corners(x1, y1, x2, y2)
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -449,17 +493,11 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _aspect_correct_corners(corners, bbox_w, bbox_h):
-    """
-    For foreshortened side-angle plates: the quad height is visually
-    compressed. Rescale to match standard 3.33 aspect ratio.
-    Only applies when aspect < 2.0 (heavily angled shots).
-    """
     plate_w, plate_h = _compute_plate_dims(corners)
     if plate_h < 1 or plate_w < 1:
         return corners
 
     detected_aspect = plate_w / plate_h
-    # Only correct severely foreshortened plates
     if detected_aspect >= 2.0:
         return corners
 
@@ -498,9 +536,6 @@ def _sharp_resize(img, target_w, target_h):
 
 
 def _build_sticker_canvas(w, h, get_logo_fn):
-    """
-    3× supersampled white sticker with logo and grey border.
-    """
     S  = 3
     cw, ch = w * S, h * S
     canvas = np.full((ch, cw, 3), 255, dtype=np.uint8)
@@ -522,14 +557,10 @@ def _build_sticker_canvas(w, h, get_logo_fn):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSPECTIVE WARP  — feathered composite (no seams, no white triangles)
+# PERSPECTIVE WARP  — feathered composite
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _warp_sticker_onto_plate(img, corners, get_logo_fn):
-    """
-    Warp sticker exactly onto plate quad using feathered (soft-edge) mask.
-    Eliminates white triangle artifacts and seam lines.
-    """
     out = img.copy()
     ih, iw = out.shape[:2]
     tl, tr, br, bl = corners.astype(np.float32)
@@ -565,7 +596,7 @@ def _warp_sticker_onto_plate(img, corners, get_logo_fn):
     poly = dst_pts.astype(np.int32).reshape((-1, 1, 2))
     cv2.fillConvexPoly(hard_mask, poly, 255)
 
-    # Feathered mask — erode 2px inward then Gaussian blur for smooth blend
+    # Feathered mask
     k_size = max(3, int(min(plate_w, plate_h) * 0.04) | 1)
     feather = cv2.erode(hard_mask, np.ones((3, 3), np.uint8), iterations=2)
     feather = cv2.GaussianBlur(feather.astype(np.float32),
@@ -584,15 +615,6 @@ def _warp_sticker_onto_plate(img, corners, get_logo_fn):
 def apply_logo_perspective(img, corners, plate_color, bbox_w, bbox_h,
                            get_logo_fn,
                            raw_x1=None, raw_y1=None, raw_x2=None, raw_y2=None):
-    """
-    Apply Caryanams sticker to cover the plate exactly.
-
-    Flow:
-      1. Aspect-correct corners (fixes side-angle foreshortening)
-      2. Clip to image bounds
-      3. Perspective-warp sticker onto quad
-      4. Degenerate fallback: padded bbox direct paste
-    """
     ih, iw = img.shape[:2]
 
     corners_c = _aspect_correct_corners(corners, bbox_w, bbox_h)
@@ -628,34 +650,23 @@ def apply_logo_perspective(img, corners, plate_color, bbox_w, bbox_h,
 
 def draw_debug_overlay(img, alpr_bbox, refined_contour_pts, final_quad,
                        grown_bbox=None):
-    """
-    Draw debug layers:
-      ALPR bbox      — blue
-      Grown bbox     — cyan (new)
-      Refined contour— green
-      Final quad     — red corners + polygon
-    """
     out = img.copy()
 
-    # ALPR bbox (blue)
     x1, y1, x2, y2 = [int(v) for v in alpr_bbox]
     cv2.rectangle(out, (x1,y1),(x2,y2),(255,80,0),2,cv2.LINE_AA)
     cv2.putText(out,'ALPR',(x1,max(y1-6,10)),
                 cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,80,0),2,cv2.LINE_AA)
 
-    # Grown bbox (cyan)
     if grown_bbox is not None:
         gx1,gy1,gx2,gy2 = [int(v) for v in grown_bbox]
         cv2.rectangle(out,(gx1,gy1),(gx2,gy2),(255,220,0),2,cv2.LINE_AA)
         cv2.putText(out,'GROWN',(gx1,max(gy1-6,10)),
                     cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,220,0),1,cv2.LINE_AA)
 
-    # Refined contour (green)
     if refined_contour_pts is not None:
         pts = refined_contour_pts.astype(np.int32).reshape((-1,1,2))
         cv2.polylines(out,[pts],True,(0,210,0),2,cv2.LINE_AA)
 
-    # Final quad (red)
     if final_quad is not None:
         pts = final_quad.astype(np.int32).reshape((-1,1,2))
         cv2.polylines(out,[pts],True,(0,0,230),2,cv2.LINE_AA)

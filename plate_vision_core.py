@@ -33,11 +33,11 @@ PLATE_MIN_ASPECT  = 1.8
 QUAD_MIN_ASPECT = 1.4
 QUAD_MAX_ASPECT = 7.0
 
-PAD_W_FRAC = 0.05
-PAD_H_FRAC = 0.10
+PAD_W_FRAC = 0.12
+PAD_H_FRAC = 0.15
 
 # Max outward expansion allowed when growing bbox (fraction of original bbox size)
-GROW_MAX_FRAC = 0.60   # can grow up to 60% outward on each side
+GROW_MAX_FRAC = 0.80   # can grow up to 80% outward on each side
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -119,8 +119,11 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
     if plate_color == 'yellow':
-        # Yellow plate: vivid yellow range (broad to catch faded plates)
-        mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
+        # Yellow plate: broad HSV range to catch Indian yellow plates
+        # (vivid yellow + slightly faded/dim + orange-yellow variants)
+        vivid   = cv2.inRange(hsv, np.array([10,  60,  80]), np.array([42, 255, 255]))
+        bright  = cv2.inRange(hsv, np.array([15, 100, 150]), np.array([38, 255, 255]))
+        mask    = cv2.bitwise_or(vivid, bright)
     else:
         # White plate: low saturation, high value
         white  = cv2.inRange(hsv, np.array([0,   0, 155]), np.array([180, 60, 255]))
@@ -128,11 +131,12 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
         slight = cv2.inRange(hsv, np.array([14, 30, 140]), np.array([38, 120, 255]))
         mask   = cv2.bitwise_or(white, slight)
 
-    # Morphological closing to bridge gaps (border lines, reflections)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    # Morphological closing to bridge gaps (border lines, reflections, plate border strip)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
 
-    MIN_PCT = 0.25   # scanline must have at least 25% plate color to keep growing
+    # Lower threshold for yellow plates — their borders eat into scanlines
+    MIN_PCT = 0.15 if plate_color == 'yellow' else 0.25
 
     max_dx = int(bw * GROW_MAX_FRAC)
     max_dy = int(bh * GROW_MAX_FRAC)
@@ -193,15 +197,27 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
         else:
             break
 
-    # Sanity: grown box must still look like a plate (aspect 1.2–8.0)
+    # ── Extra forced padding for yellow plates (covers logo/text gaps) ──────
+    if plate_color == "yellow":
+        extra_x = max(12, int(bw * 0.20))   # 20% extra left+right
+        extra_y = max(6,  int(bh * 0.18))   # 18% extra top+bottom
+        new_x1 = max(0,  new_x1 - extra_x)
+        new_x2 = min(iw, new_x2 + extra_x)
+        new_y1 = max(0,  new_y1 - extra_y)
+        new_y2 = min(ih, new_y2 + extra_y)
+
+    # Sanity: grown box must still look like a plate (aspect 1.0–9.0)
     gw = new_x2 - new_x1
     gh = new_y2 - new_y1
-    if gh > 0 and 1.2 <= gw / gh <= 8.0:
+    if gh > 0 and 1.0 <= gw / gh <= 9.0:
         return (max(0, new_x1), max(0, new_y1),
                 min(iw, new_x2), min(ih, new_y2))
 
-    # Fallback: original ALPR box unchanged
-    return x1, y1, x2, y2
+    # Fallback: original ALPR box + forced padding
+    pad_x = max(12, int(bw * 0.20))
+    pad_y = max(6,  int(bh * 0.18))
+    return (max(0, x1 - pad_x), max(0, y1 - pad_y),
+            min(iw, x2 + pad_x), min(ih, y2 + pad_y))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -225,13 +241,13 @@ def detect_plate_color(img, x1, y1, x2, y2):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
     # Pass 1 — strict
-    strict = cv2.inRange(hsv, np.array([18, 130, 130]), np.array([34, 255, 255]))
-    if np.mean(strict) / 255.0 > 0.20:
+    strict = cv2.inRange(hsv, np.array([15, 100, 120]), np.array([38, 255, 255]))
+    if np.mean(strict) / 255.0 > 0.15:
         return 'yellow'
 
     # Pass 2 — relaxed (faded/dim yellow plates like old taxis)
-    relaxed = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
-    if np.mean(relaxed) / 255.0 > 0.28:
+    relaxed = cv2.inRange(hsv, np.array([10, 60, 80]), np.array([42, 255, 255]))
+    if np.mean(relaxed) / 255.0 > 0.20:
         return 'yellow'
 
     return 'white'
@@ -244,14 +260,16 @@ def detect_plate_color(img, x1, y1, x2, y2):
 def _color_plate_mask(crop, plate_hint='white'):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     if plate_hint == 'yellow':
-        mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
+        vivid  = cv2.inRange(hsv, np.array([10,  60,  80]), np.array([42, 255, 255]))
+        bright = cv2.inRange(hsv, np.array([15, 100, 150]), np.array([38, 255, 255]))
+        mask   = cv2.bitwise_or(vivid, bright)
     else:
         white  = cv2.inRange(hsv, np.array([0,   0, 155]), np.array([180, 60, 255]))
         slight = cv2.inRange(hsv, np.array([14, 30, 140]), np.array([38, 120, 255]))
         mask   = cv2.bitwise_or(white, slight)
 
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
     return mask
 
@@ -634,8 +652,8 @@ def apply_logo_perspective(img, corners, plate_color, bbox_w, bbox_h,
         x1 = int(min(tl[0], bl[0])); y1 = int(min(tl[1], tr[1]))
         x2 = int(max(tr[0], br[0])); y2 = int(max(bl[1], br[1]))
 
-    pad_w = int((x2 - x1) * PAD_W_FRAC)
-    pad_h = int((y2 - y1) * PAD_H_FRAC)
+    pad_w = int((x2 - x1) * (PAD_W_FRAC * 2 if plate_color == 'yellow' else PAD_W_FRAC))
+    pad_h = int((y2 - y1) * (PAD_H_FRAC * 2 if plate_color == 'yellow' else PAD_H_FRAC))
     x1 = max(0,  x1 - pad_w); y1 = max(0,  y1 - pad_h)
     x2 = min(iw, x2 + pad_w); y2 = min(ih, y2 + pad_h)
     pw = max(10, x2 - x1);    ph = max(5,  y2 - y1)

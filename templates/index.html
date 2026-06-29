@@ -29,6 +29,20 @@
         .corner-bbox  { background: #fff3cd; color: #856404; }
         .v5-badge     { font-size: 0.7rem; background: #059669; color: #fff; padding: 2px 7px; border-radius: 10px; vertical-align: middle; margin-left: 4px; }
         .angle-badge  { font-size: 0.7rem; background: #2563eb; color: #fff; padding: 2px 7px; border-radius: 10px; vertical-align: middle; margin-left: 4px; }
+
+        /* Capture lock styles */
+        .btn.locked   { opacity: 0.45; cursor: not-allowed; filter: grayscale(60%); }
+        .capture-lock-msg {
+            text-align: center;
+            font-size: 0.82rem;
+            color: #b45309;
+            background: #fef3c7;
+            border: 1px solid #f59e0b;
+            border-radius: 8px;
+            padding: 7px 14px;
+            margin: 6px 0 0 0;
+        }
+        .capture-lock-msg.hidden { display: none; }
     </style>
 </head>
 <body>
@@ -36,7 +50,7 @@
 
     <header>
         <span class="logo">🚘 PlateVision <span class="v2">v4</span><span class="v5-badge">Multi-Fix</span></span>
-        <span class="badge">Auto-fit sticker · Any angle </span>
+        <span class="badge">Auto-fit sticker · Any angle · Like Spinny &amp; Car24</span>
     </header>
 
     <!-- Mode selector -->
@@ -69,9 +83,10 @@
         </div>
         <div class="controls">
             <button class="btn g" id="btnStart" onclick="startCamera()">▶ Start Camera</button>
-            <button class="btn o" id="btnCapture" onclick="captureFrame()" disabled>📸 Capture</button>
+            <button class="btn o locked" id="btnCapture" onclick="captureFrame()" disabled>🔒 Capture</button>
             <button class="btn r" id="btnStop" onclick="stopCamera()" disabled>⏹ Stop</button>
         </div>
+        <p id="captureLockMsg" class="capture-lock-msg">⚠️ Pehle <strong>Start Camera</strong> dabao, tab Capture unlock hoga</p>
     </div>
 
     <!-- Upload -->

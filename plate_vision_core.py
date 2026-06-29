@@ -98,112 +98,145 @@ def _compute_plate_dims(corners):
 
 def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
     """
-    Walk outward from the ALPR bbox in all 4 directions until we stop seeing
-    plate-colored pixels. This corrects ALPR's chronic undersizing.
+    Find the TRUE plate boundary from the ALPR bbox.
 
-    Strategy:
-    - Build a plate-color binary mask for the whole image
-    - Starting from each edge of the ALPR box, move outward 1px at a time
-    - Stop when a scanline has < MIN_COLOR_PCT plate pixels
-    - Limit growth to GROW_MAX_FRAC of the original bbox dimension
-    - Result is the TRUE plate bounding box
+    Strategy differs by plate color:
+    - YELLOW: color walk (yellow is distinctive vs car body)
+    - WHITE:  edge-based search — look for the dark border/frame around the
+              plate using Canny edges in an expanded search region. This works
+              even when car body is also white.
 
-    Works for both white plates (VW Polo angled) and yellow plates (Innova).
+    Returns (x1, y1, x2, y2) of the true plate boundary.
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     bw = x2 - x1
     bh = y2 - y1
 
-    # Build color mask on full image
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
+    # ── YELLOW PLATE: color walk (works great, distinctive color) ──────────
     if plate_color == 'yellow':
-        # Yellow plate: vivid yellow range (broad to catch faded plates)
+        hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
-    else:
-        # White plate: tight high-saturation-free, very high brightness
-        # Key: plate has very low saturation (0-40) AND very high value (200+)
-        # Car body at angles has lower value due to lighting/curvature
-        white  = cv2.inRange(hsv, np.array([0,   0, 200]), np.array([180, 40, 255]))
-        # Slightly yellowish old plates — still tight saturation
-        slight = cv2.inRange(hsv, np.array([14, 20, 185]), np.array([38, 80, 255]))
-        mask   = cv2.bitwise_or(white, slight)
+        k    = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
 
-    # Morphological closing to bridge gaps (border lines, reflections)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+        MIN_PCT  = 0.35
+        max_dx   = int(bw * 0.50)
+        max_dy   = int(bh * 0.50)
+        new_x1, new_x2, new_y1, new_y2 = x1, x2, y1, y2
 
-    MIN_PCT = 0.55   # scanline must have at least 55% plate color to keep growing
+        for d in range(1, max_dx + 1):
+            col = x1 - d
+            if col < 0: break
+            if np.mean(mask[max(0,y1):min(ih,y2), col:col+1]) / 255.0 >= MIN_PCT:
+                new_x1 = col
+            else: break
+        for d in range(1, max_dx + 1):
+            col = x2 + d - 1
+            if col >= iw: break
+            if np.mean(mask[max(0,y1):min(ih,y2), col:col+1]) / 255.0 >= MIN_PCT:
+                new_x2 = col + 1
+            else: break
+        for d in range(1, max_dy + 1):
+            row = y1 - d
+            if row < 0: break
+            if np.mean(mask[row:row+1, max(0,new_x1):min(iw,new_x2)]) / 255.0 >= MIN_PCT:
+                new_y1 = row
+            else: break
+        for d in range(1, max_dy + 1):
+            row = y2 + d - 1
+            if row >= ih: break
+            if np.mean(mask[row:row+1, max(0,new_x1):min(iw,new_x2)]) / 255.0 >= MIN_PCT:
+                new_y2 = row + 1
+            else: break
 
-    max_dx = int(bw * GROW_MAX_FRAC)
-    max_dy = int(bh * GROW_MAX_FRAC)
+        gw, gh = new_x2 - new_x1, new_y2 - new_y1
+        if gh > 0 and 1.8 <= gw / gh <= 6.0:
+            return (max(0, new_x1), max(0, new_y1),
+                    min(iw, new_x2), min(ih, new_y2))
+        return x1, y1, x2, y2
 
-    # ── Grow LEFT ──────────────────────────────────────────────────────────
-    new_x1 = x1
-    for d in range(1, max_dx + 1):
-        col = x1 - d
-        if col < 0:
-            break
-        strip = mask[max(0, y1):min(ih, y2), col:col+1]
-        if strip.size == 0:
-            break
-        if np.mean(strip) / 255.0 >= MIN_PCT:
-            new_x1 = col
-        else:
-            break
+    # ── WHITE PLATE: edge-based search ────────────────────────────────────
+    # Indian white plates have a distinct DARK BLUE/BLACK border frame.
+    # Find contours in a padded search region, pick the rectangle that
+    # best matches plate aspect ratio and encloses the ALPR center.
 
-    # ── Grow RIGHT ─────────────────────────────────────────────────────────
-    new_x2 = x2
-    for d in range(1, max_dx + 1):
-        col = x2 + d - 1
-        if col >= iw:
-            break
-        strip = mask[max(0, y1):min(ih, y2), col:col+1]
-        if strip.size == 0:
-            break
-        if np.mean(strip) / 255.0 >= MIN_PCT:
-            new_x2 = col + 1
-        else:
-            break
+    # Search region: expand ALPR box by 35% on each side
+    pad_x = int(bw * 0.35)
+    pad_y = int(bh * 0.35)
+    sx1 = max(0,  x1 - pad_x)
+    sy1 = max(0,  y1 - pad_y)
+    sx2 = min(iw, x2 + pad_x)
+    sy2 = min(ih, y2 + pad_y)
+    crop = img[sy1:sy2, sx1:sx2]
+    if crop.size == 0:
+        return x1, y1, x2, y2
 
-    # ── Grow TOP ───────────────────────────────────────────────────────────
-    new_y1 = y1
-    for d in range(1, max_dy + 1):
-        row = y1 - d
-        if row < 0:
-            break
-        strip = mask[row:row+1, max(0, new_x1):min(iw, new_x2)]
-        if strip.size == 0:
-            break
-        if np.mean(strip) / 255.0 >= MIN_PCT:
-            new_y1 = row
-        else:
-            break
+    gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    gray    = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges   = cv2.Canny(blurred, 30, 100)
+    kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+    edges   = cv2.dilate(edges, kernel, iterations=1)
 
-    # ── Grow BOTTOM ────────────────────────────────────────────────────────
-    new_y2 = y2
-    for d in range(1, max_dy + 1):
-        row = y2 + d - 1
-        if row >= ih:
-            break
-        strip = mask[row:row+1, max(0, new_x1):min(iw, new_x2)]
-        if strip.size == 0:
-            break
-        if np.mean(strip) / 255.0 >= MIN_PCT:
-            new_y2 = row + 1
-        else:
-            break
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return x1, y1, x2, y2
 
-    # Sanity: grown box must still look like a plate (aspect 1.8–6.0)
-    gw = new_x2 - new_x1
-    gh = new_y2 - new_y1
-    if gh > 0 and 1.8 <= gw / gh <= 6.0:
-        return (max(0, new_x1), max(0, new_y1),
-                min(iw, new_x2), min(ih, new_y2))
+    alpr_cx = (x1 + x2) / 2.0
+    alpr_cy = (y1 + y2) / 2.0
+    alpr_area = float(bw * bh)
 
-    # Fallback: original ALPR box unchanged
-    return x1, y1, x2, y2
+    best_bbox = None
+    best_score = -1.0
+
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        # Must be at least 40% of ALPR area and not more than 4x
+        if area < alpr_area * 0.40 or area > alpr_area * 4.0:
+            continue
+
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        if rh < 5 or rw < 10:
+            continue
+        aspect = rw / rh
+        if not (1.5 <= aspect <= 6.5):
+            continue
+
+        # Convert back to full-image coords
+        gx1 = rx + sx1; gy1 = ry + sy1
+        gx2 = gx1 + rw; gy2 = gy1 + rh
+
+        # Center must be near ALPR center
+        cx = (gx1 + gx2) / 2.0
+        cy = (gy1 + gy2) / 2.0
+        dist = ((cx - alpr_cx)**2 + (cy - alpr_cy)**2) ** 0.5
+        if dist > max(bw, bh) * 0.5:
+            continue
+
+        # Score: prefer aspect close to 3.33, penalize distance from center
+        aspect_score = 1.0 - abs(aspect - 3.33) / 3.33
+        dist_score   = 1.0 - dist / (max(bw, bh) * 0.5 + 1)
+        score        = aspect_score * 0.6 + dist_score * 0.4
+
+        if score > best_score:
+            best_score = score
+            best_bbox  = (gx1, gy1, gx2, gy2)
+
+    if best_bbox is not None:
+        gx1, gy1, gx2, gy2 = best_bbox
+        gw, gh = gx2 - gx1, gy2 - gy1
+        if gh > 0 and 1.8 <= gw / gh <= 6.0:
+            # Small fixed padding (3%) to ensure full coverage
+            pw = int(gw * 0.03); ph = int(gh * 0.03)
+            return (max(0, gx1 - pw), max(0, gy1 - ph),
+                    min(iw, gx2 + pw), min(ih, gy2 + ph))
+
+    # Fallback: ALPR box + small fixed padding (8%)
+    pw = int(bw * 0.08); ph = int(bh * 0.08)
+    return (max(0, x1 - pw), max(0, y1 - ph),
+            min(iw, x2 + pw), min(ih, y2 + ph))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

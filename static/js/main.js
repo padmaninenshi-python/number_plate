@@ -2,6 +2,7 @@
 
 let stream = null, uploadData = null;
 let currentMode = 'logo';
+let cameraActive = false;   // ← NEW: track camera state
 
 function setMode(m) {
     currentMode = m;
@@ -18,6 +19,21 @@ function switchTab(t) {
     hide('result');
 }
 
+// ── NEW: update capture button lock state ─────────────────────────────────────
+function _updateCaptureLock() {
+    const btn      = document.getElementById('btnCapture');
+    const lockMsg  = document.getElementById('captureLockMsg');
+    if (cameraActive) {
+        btn.disabled = false;
+        btn.classList.remove('locked');
+        if (lockMsg) lockMsg.classList.add('hidden');
+    } else {
+        btn.disabled = true;
+        btn.classList.add('locked');
+        if (lockMsg) lockMsg.classList.remove('hidden');
+    }
+}
+
 async function startCamera() {
     try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -28,55 +44,28 @@ async function startCamera() {
         v.srcObject = stream; v.play();
         document.getElementById('placeholder').classList.add('hidden');
         document.getElementById('scanLine').classList.add('active');
-        dis('btnStart', true); dis('btnCapture', false); dis('btnStop', false);
+        dis('btnStart', true); dis('btnStop', false);
+        cameraActive = true;        // ← unlock
+        _updateCaptureLock();
     } catch(e) { alert('Camera error: ' + e.message); }
 }
 
 function stopCamera() {
-    unfreezeCamera();
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     const v = document.getElementById('videoEl'); v.srcObject = null;
     document.getElementById('placeholder').classList.remove('hidden');
     document.getElementById('scanLine').classList.remove('active');
-    dis('btnStart', false); dis('btnCapture', true); dis('btnStop', true);
+    dis('btnStart', false); dis('btnStop', true);
+    cameraActive = false;           // ← lock
+    _updateCaptureLock();
 }
 
 function captureFrame() {
+    if (!cameraActive) return;      // ← extra guard
     const v = document.getElementById('videoEl'), c = document.getElementById('canvas');
     c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
-
-    // Freeze: hide video (keep space), place canvas inside same video-box
-    v.style.visibility = 'hidden';
-    v.pause();
-
-    const box = v.parentElement; // .video-box
-    box.style.position = 'relative'; // ensure relative
-
-    c.style.position   = 'absolute';
-    c.style.top        = v.offsetTop  + 'px';
-    c.style.left       = v.offsetLeft + 'px';
-    c.style.width      = v.offsetWidth  + 'px';
-    c.style.height     = v.offsetHeight + 'px';
-    c.style.objectFit  = 'cover';
-    c.style.zIndex     = '10';
-    c.style.display    = 'block';
-    c.style.margin     = '0';
-    c.style.padding    = '0';
-    c.style.borderRadius = getComputedStyle(v).borderRadius;
-
-    box.appendChild(c); // move canvas inside video-box
-
-    dis('btnCapture', true);
     send(c.toDataURL('image/jpeg', 0.98));
-}
-
-function unfreezeCamera() {
-    const v = document.getElementById('videoEl'), c = document.getElementById('canvas');
-    c.style.display = 'none';
-    v.style.visibility = 'visible';
-    if (stream) v.play();
-    dis('btnCapture', false);
 }
 
 function handleFile(e) {
@@ -97,6 +86,10 @@ function detectFromUpload() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Enforce lock on page load
+    cameraActive = false;
+    _updateCaptureLock();
+
     const dz = document.getElementById('dropzone');
     dz.addEventListener('dragover',  e => { e.preventDefault(); dz.style.borderColor = 'var(--o)'; });
     dz.addEventListener('dragleave', () => dz.style.borderColor = '');
@@ -117,10 +110,9 @@ async function send(imageData) {
         });
         const d = await res.json();
         hide('loading');
-        unfreezeCamera();
         if (d.error) { alert('Error: ' + d.error + '\n\n' + (d.trace||'')); return; }
         showResult(d);
-    } catch(e) { hide('loading'); unfreezeCamera(); alert('Network error: ' + e.message); }
+    } catch(e) { hide('loading'); alert('Network error: ' + e.message); }
 }
 
 function showResult(d) {
@@ -130,6 +122,7 @@ function showResult(d) {
     const plate = d.plate_text || '—';
     document.getElementById('plateNumber').textContent = plate;
 
+    // Plate type badge
     const colorLabel = d.plate_color === 'yellow'
         ? '<span class="plate-type-badge badge-yellow">🟡 Yellow / Rear</span>'
         : '<span class="plate-type-badge badge-white">⬜ White / Front</span>';
@@ -143,6 +136,7 @@ function showResult(d) {
             ? `✅ ${plate}  •  ${modeBadge}${confBadge}${enhBadge} ${colorLabel}`
             : `${d.message}  •  ${modeBadge}${confBadge}${enhBadge} ${colorLabel}`;
 
+    // Corner detection info
     const ci = document.getElementById('cornerInfo');
     if (d.perspective_quad) {
         ci.textContent = '✅ Perspective quad fitted — logo perfectly matches plate angle';

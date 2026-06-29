@@ -348,22 +348,102 @@ def _expanded_bbox_quad(x1, y1, x2, y2, img_w, img_h):
 
 def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
     """
-    Get the 4 plate corners using the ALPR bbox + small padding.
+    Detect true 4 corners of the plate including perspective angle.
 
-    For straight-on shots (the vast majority of Indian car listing photos),
-    the ALPR bbox IS the plate rectangle — no contour/color detection needed.
-    Contour detection was causing oversized or mis-sized stickers.
+    For straight-on shots: ALPR bbox corners work fine.
+    For angled shots: use minAreaRect on edges inside bbox to get
+    the true rotated rectangle matching plate angle exactly.
 
     Returns np.float32 (4,2): [TL, TR, BR, BL].
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    bw = x2 - x1
+    bh = y2 - y1
 
-    # Get padded bbox (tiny fixed padding only)
-    gx1, gy1, gx2, gy2 = _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_hint)
+    # Expand search region slightly for edge detection
+    pad_x = int(bw * 0.12)
+    pad_y = int(bh * 0.15)
+    cx1 = max(0,  x1 - pad_x)
+    cy1 = max(0,  y1 - pad_y)
+    cx2 = min(iw, x2 + pad_x)
+    cy2 = min(ih, y2 + pad_y)
+    crop = img[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return _bbox_corners(x1, y1, x2, y2)
 
-    # Return as clean rectangle corners
-    return _bbox_corners(gx1, gy1, gx2, gy2)
+    gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    gray    = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 25, 90)
+    kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+    edges   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    alpr_cx = (x1 + x2) / 2.0
+    alpr_cy = (y1 + y2) / 2.0
+    alpr_area = float(bw * bh)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_quad = None
+    best_score = -1.0
+
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < alpr_area * 0.25 or area > alpr_area * 3.5:
+            continue
+
+        # Try approxPolyDP first (gives exact 4-corner quad)
+        peri = cv2.arcLength(cnt, True)
+        for eps in [0.02, 0.03, 0.05, 0.07, 0.10]:
+            approx = cv2.approxPolyDP(cnt, eps * peri, True)
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2).astype(np.float32)
+                pts[:, 0] += cx1
+                pts[:, 1] += cy1
+                pts = _order_corners(pts)
+                w, h = _compute_plate_dims(pts)
+                if h < 4: continue
+                aspect = w / h
+                if not (1.5 <= aspect <= 7.0): continue
+                if not _is_convex(pts): continue
+                # Center proximity check
+                cx = pts[:, 0].mean(); cy = pts[:, 1].mean()
+                dist = ((cx - alpr_cx)**2 + (cy - alpr_cy)**2) ** 0.5
+                if dist > max(bw, bh) * 0.6: continue
+                score = (1.0 - abs(aspect - 3.33) / 3.33) * 0.5 + \
+                        (1.0 - dist / (max(bw, bh) * 0.6 + 1)) * 0.5
+                if score > best_score:
+                    best_score = score
+                    best_quad = pts
+                break
+
+        # minAreaRect fallback per contour
+        if best_quad is None or best_score < 0.4:
+            rect = cv2.minAreaRect(cnt)
+            box  = cv2.boxPoints(rect).astype(np.float32)
+            box[:, 0] += cx1
+            box[:, 1] += cy1
+            pts = _order_corners(box)
+            w, h = _compute_plate_dims(pts)
+            if h >= 4:
+                aspect = w / h
+                if 1.5 <= aspect <= 7.0 and _is_convex(pts):
+                    cx = pts[:, 0].mean(); cy = pts[:, 1].mean()
+                    dist = ((cx - alpr_cx)**2 + (cy - alpr_cy)**2) ** 0.5
+                    if dist <= max(bw, bh) * 0.6:
+                        score = (1.0 - abs(aspect - 3.33) / 3.33) * 0.5 + \
+                                (1.0 - dist / (max(bw, bh) * 0.6 + 1)) * 0.5
+                        if score > best_score:
+                            best_score = score
+                            best_quad = pts
+
+    if best_quad is not None:
+        return best_quad
+
+    # Fallback: ALPR bbox as rectangle
+    return _bbox_corners(x1, y1, x2, y2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -372,19 +452,18 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
 
 def _aspect_correct_corners(corners, bbox_w, bbox_h):
     """
-    Aspect correction for heavily angled/foreshortened plates.
-    Only applies when the plate appears severely compressed (aspect < 1.5).
-    For straight-on shots this returns corners unchanged.
+    For foreshortened side-angle plates: the quad height is visually
+    compressed. Rescale to match standard 3.33 aspect ratio.
+    Only applies when aspect < 2.0 (heavily angled shots).
     """
     plate_w, plate_h = _compute_plate_dims(corners)
     if plate_h < 1 or plate_w < 1:
         return corners
 
     detected_aspect = plate_w / plate_h
-    # Only correct when VERY compressed (side-angle shots)
-    # Straight-on plates have aspect ~3.33, skip correction for those
-    if detected_aspect >= 1.5:
-        return corners  # straight-on shot, no correction needed
+    # Only correct severely foreshortened plates
+    if detected_aspect >= 2.0:
+        return corners
 
     target_h  = plate_w / PLATE_STD_ASPECT
     scale     = target_h / plate_h

@@ -325,12 +325,11 @@ def detect():
             )
 
         else:  # 'logo'
-            # Use GROWN bbox dimensions for aspect correction (more accurate)
             result_img = apply_logo_perspective(
                 img, corners, plate_color,
-                grown_bbox_w, grown_bbox_h,
+                bbox_w, bbox_h,
                 get_logo_fn=get_logo,
-                raw_x1=gx1, raw_y1=gy1, raw_x2=gx2, raw_y2=gy2,
+                raw_x1=bb.x1, raw_y1=bb.y1, raw_x2=bb.x2, raw_y2=bb.y2,
             )
 
         is_perspective_quad = not _is_axis_aligned_box(corners)

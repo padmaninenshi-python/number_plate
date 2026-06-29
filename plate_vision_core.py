@@ -348,59 +348,98 @@ def _expanded_bbox_quad(x1, y1, x2, y2, img_w, img_h):
 
 def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
     """
-    Get exact 4 corners of the plate for perspective-correct sticker placement.
+    Find exact 4 corners of the plate including tilt/perspective angle.
 
-    APPROACH:
-    1. Take the ALPR bbox as the ground truth region
-    2. Run minAreaRect on ALL edge points inside that exact bbox
-       → gives the rotated rectangle that best fits the plate angle
-    3. Validate: if result is close to ALPR bbox size, use it
-    4. Fallback: ALPR bbox as axis-aligned rectangle
+    KEY INSIGHT: Look AROUND the plate (dark bumper frame) not INSIDE it.
+    Inside has noisy text edges. Outside has clean plate border lines.
 
-    This is robust because:
-    - No contour filtering (which was picking wrong contours)
-    - minAreaRect on the whole crop always finds dominant rectangle angle
-    - ALPR bbox is already accurate — we just need the tilt angle
+    Algorithm:
+    1. Expand bbox by ~20% on each side to see the dark border frame
+    2. Threshold: isolate the bright white plate region against dark surround
+    3. findContours on the white region → plate outline
+    4. minAreaRect on largest contour → rotated rectangle = plate corners
+    5. Validate size matches ALPR bbox; fallback to ALPR bbox if not
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     bw = x2 - x1
     bh = y2 - y1
 
-    # Work strictly inside ALPR bbox (no expansion — avoids picking car body)
-    crop = img[max(0,y1):min(ih,y2), max(0,x1):min(iw,x2)]
+    # Expand to see surrounding dark frame (plate sits in dark bumper)
+    ex = int(bw * 0.25)
+    ey = int(bh * 0.35)
+    ex1 = max(0,  x1 - ex);  ey1 = max(0,  y1 - ey)
+    ex2 = min(iw, x2 + ex);  ey2 = min(ih, y2 + ey)
+    crop = img[ey1:ey2, ex1:ex2]
     if crop.size == 0:
         return _bbox_corners(x1, y1, x2, y2)
 
-    gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    gray    = clahe.apply(gray)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges   = cv2.Canny(blurred, 20, 80)
-    k       = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
-    edges   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=1)
+    # Convert to grayscale and threshold: white plate vs dark surround
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # OTSU threshold finds the natural white/dark split
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    pts = cv2.findNonZero(edges)
-    if pts is not None and len(pts) >= 8:
-        rect  = cv2.minAreaRect(pts)
-        angle = rect[2]  # rotation angle in degrees
+    # Morphological close to fill text gaps inside plate
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k, iterations=3)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k, iterations=1)
 
-        # Only use rotated rect if there's meaningful angle (>2 degrees)
-        # For near-straight plates, axis-aligned bbox is more accurate
-        if abs(angle) > 2.0 and abs(angle) < 88.0:
-            box = cv2.boxPoints(rect).astype(np.float32)
-            # Translate back to full image coords
-            box[:, 0] += x1
-            box[:, 1] += y1
-            ordered = _order_corners(box)
-            w, h = _compute_plate_dims(ordered)
-            # Validate: result must be close to ALPR bbox size (within 30%)
-            if (h >= 4 and w >= 4 and
-                abs(w - bw) < bw * 0.30 and
-                abs(h - bh) < bh * 0.30):
-                return ordered
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return _bbox_corners(x1, y1, x2, y2)
 
-    # Fallback: use ALPR bbox directly as perfect rectangle
+    # ALPR center in crop coords
+    alpr_cx = (x1 + x2) / 2.0 - ex1
+    alpr_cy = (y1 + y2) / 2.0 - ey1
+    alpr_area = float(bw * bh)
+
+    best = None
+    best_score = -1.0
+
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        # Must overlap well with ALPR area
+        if area < alpr_area * 0.30 or area > alpr_area * 4.0:
+            continue
+        # Center must be close to ALPR center
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        cx = M['m10'] / M['m00']
+        cy = M['m01'] / M['m00']
+        dist = ((cx - alpr_cx)**2 + (cy - alpr_cy)**2) ** 0.5
+        if dist > max(bw, bh) * 0.5:
+            continue
+
+        rect = cv2.minAreaRect(cnt)
+        rw, rh = rect[1]
+        if rh == 0:
+            continue
+        aspect = max(rw, rh) / min(rw, rh)
+        if not (1.5 <= aspect <= 7.0):
+            continue
+
+        score = (1.0 - abs(aspect - 3.33) / 5.0) * 0.6 + \
+                (1.0 - dist / (max(bw, bh) * 0.5 + 1)) * 0.4
+        if score > best_score:
+            best_score = score
+            best = (cnt, rect)
+
+    if best is not None:
+        cnt, rect = best
+        box = cv2.boxPoints(rect).astype(np.float32)
+        # Translate back to full image coords
+        box[:, 0] += ex1
+        box[:, 1] += ey1
+        ordered = _order_corners(box)
+        w, h = _compute_plate_dims(ordered)
+        # Accept if size is reasonable (50%–200% of ALPR bbox)
+        if (h >= 4 and w >= 4 and
+            bw * 0.50 <= w <= bw * 2.0 and
+            bh * 0.50 <= h <= bh * 2.0):
+            return ordered
+
+    # Fallback: ALPR bbox directly
     return _bbox_corners(x1, y1, x2, y2)
 
 

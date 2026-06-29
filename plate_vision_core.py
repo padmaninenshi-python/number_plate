@@ -33,11 +33,11 @@ PLATE_MIN_ASPECT  = 1.8
 QUAD_MIN_ASPECT = 1.4
 QUAD_MAX_ASPECT = 7.0
 
-PAD_W_FRAC = 0.12
-PAD_H_FRAC = 0.15
+PAD_W_FRAC = 0.02
+PAD_H_FRAC = 0.04
 
 # Max outward expansion allowed when growing bbox (fraction of original bbox size)
-GROW_MAX_FRAC = 0.80   # can grow up to 80% outward on each side
+GROW_MAX_FRAC = 0.55   # can grow up to 55% outward on each side
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -136,7 +136,7 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
 
     # Lower threshold for yellow plates — their borders eat into scanlines
-    MIN_PCT = 0.15 if plate_color == 'yellow' else 0.25
+    MIN_PCT = 0.15 if plate_color == 'yellow' else 0.38
 
     max_dx = int(bw * GROW_MAX_FRAC)
     max_dy = int(bh * GROW_MAX_FRAC)
@@ -213,9 +213,9 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
         return (max(0, new_x1), max(0, new_y1),
                 min(iw, new_x2), min(ih, new_y2))
 
-    # Fallback: original ALPR box + forced padding
-    pad_x = max(12, int(bw * 0.20))
-    pad_y = max(6,  int(bh * 0.18))
+    # Fallback: original ALPR box + minimal padding (white) or more (yellow)
+    pad_x = max(12, int(bw * 0.20)) if plate_color == "yellow" else max(2, int(bw * 0.02))
+    pad_y = max(6,  int(bh * 0.18)) if plate_color == "yellow" else max(1, int(bh * 0.04))
     return (max(0, x1 - pad_x), max(0, y1 - pad_y),
             min(iw, x2 + pad_x), min(ih, y2 + pad_y))
 
@@ -652,8 +652,8 @@ def apply_logo_perspective(img, corners, plate_color, bbox_w, bbox_h,
         x1 = int(min(tl[0], bl[0])); y1 = int(min(tl[1], tr[1]))
         x2 = int(max(tr[0], br[0])); y2 = int(max(bl[1], br[1]))
 
-    pad_w = int((x2 - x1) * (PAD_W_FRAC * 2 if plate_color == 'yellow' else PAD_W_FRAC))
-    pad_h = int((y2 - y1) * (PAD_H_FRAC * 2 if plate_color == 'yellow' else PAD_H_FRAC))
+    pad_w = int((x2 - x1) * (0.18 if plate_color == "yellow" else PAD_W_FRAC))
+    pad_h = int((y2 - y1) * (0.15 if plate_color == "yellow" else PAD_H_FRAC))
     x1 = max(0,  x1 - pad_w); y1 = max(0,  y1 - pad_h)
     x2 = min(iw, x2 + pad_w); y2 = min(ih, y2 + pad_h)
     pw = max(10, x2 - x1);    ph = max(5,  y2 - y1)

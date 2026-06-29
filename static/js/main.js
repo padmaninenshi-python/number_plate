@@ -42,6 +42,8 @@ async function startCamera() {
         });
         const v = document.getElementById('videoEl');
         v.srcObject = stream; v.play();
+        document.getElementById('placeholderIcon').textContent = '📷';
+        document.getElementById('placeholderText').textContent = 'Click Start Camera';
         document.getElementById('placeholder').classList.add('hidden');
         document.getElementById('scanLine').classList.add('active');
         dis('btnStart', true); dis('btnStop', false);
@@ -54,6 +56,8 @@ function stopCamera() {
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     const v = document.getElementById('videoEl');
     v.pause(); v.srcObject = null;
+    document.getElementById('placeholderIcon').textContent = '⏹';
+    document.getElementById('placeholderText').textContent = 'Camera stopped — click Start Camera to restart';
     document.getElementById('placeholder').classList.remove('hidden');
     document.getElementById('scanLine').classList.remove('active');
     dis('btnStart', false); dis('btnStop', true);

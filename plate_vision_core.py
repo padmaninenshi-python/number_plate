@@ -98,145 +98,36 @@ def _compute_plate_dims(corners):
 
 def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
     """
-    Find the TRUE plate boundary from the ALPR bbox.
+    Return the plate boundary from the ALPR bbox.
 
-    Strategy differs by plate color:
-    - YELLOW: color walk (yellow is distinctive vs car body)
-    - WHITE:  edge-based search — look for the dark border/frame around the
-              plate using Canny edges in an expanded search region. This works
-              even when car body is also white.
+    KEY INSIGHT: ALPR (yolo-v9 license plate model) is already very accurate
+    for Indian plates. The old color/edge walk was OVER-EXPANDING and causing
+    the sticker to be too large.
 
-    Returns (x1, y1, x2, y2) of the true plate boundary.
+    NEW APPROACH:
+    - Trust the ALPR bbox as-is
+    - Add a tiny fixed padding (4% W, 6% H) to ensure full border coverage
+    - Yellow plates get slightly more padding (they can have thicker frames)
+    - No color walk, no edge walk — those caused the oversized sticker issue
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     bw = x2 - x1
     bh = y2 - y1
 
-    # ── YELLOW PLATE: color walk (works great, distinctive color) ──────────
     if plate_color == 'yellow':
-        hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
-        k    = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+        pw = int(bw * 0.06)
+        ph = int(bh * 0.08)
+    else:
+        pw = int(bw * 0.04)
+        ph = int(bh * 0.06)
 
-        MIN_PCT  = 0.35
-        max_dx   = int(bw * 0.50)
-        max_dy   = int(bh * 0.50)
-        new_x1, new_x2, new_y1, new_y2 = x1, x2, y1, y2
-
-        for d in range(1, max_dx + 1):
-            col = x1 - d
-            if col < 0: break
-            if np.mean(mask[max(0,y1):min(ih,y2), col:col+1]) / 255.0 >= MIN_PCT:
-                new_x1 = col
-            else: break
-        for d in range(1, max_dx + 1):
-            col = x2 + d - 1
-            if col >= iw: break
-            if np.mean(mask[max(0,y1):min(ih,y2), col:col+1]) / 255.0 >= MIN_PCT:
-                new_x2 = col + 1
-            else: break
-        for d in range(1, max_dy + 1):
-            row = y1 - d
-            if row < 0: break
-            if np.mean(mask[row:row+1, max(0,new_x1):min(iw,new_x2)]) / 255.0 >= MIN_PCT:
-                new_y1 = row
-            else: break
-        for d in range(1, max_dy + 1):
-            row = y2 + d - 1
-            if row >= ih: break
-            if np.mean(mask[row:row+1, max(0,new_x1):min(iw,new_x2)]) / 255.0 >= MIN_PCT:
-                new_y2 = row + 1
-            else: break
-
-        gw, gh = new_x2 - new_x1, new_y2 - new_y1
-        if gh > 0 and 1.8 <= gw / gh <= 6.0:
-            return (max(0, new_x1), max(0, new_y1),
-                    min(iw, new_x2), min(ih, new_y2))
-        return x1, y1, x2, y2
-
-    # ── WHITE PLATE: edge-based search ────────────────────────────────────
-    # Indian white plates have a distinct DARK BLUE/BLACK border frame.
-    # Find contours in a padded search region, pick the rectangle that
-    # best matches plate aspect ratio and encloses the ALPR center.
-
-    # Search region: expand ALPR box by 35% on each side
-    pad_x = int(bw * 0.35)
-    pad_y = int(bh * 0.35)
-    sx1 = max(0,  x1 - pad_x)
-    sy1 = max(0,  y1 - pad_y)
-    sx2 = min(iw, x2 + pad_x)
-    sy2 = min(ih, y2 + pad_y)
-    crop = img[sy1:sy2, sx1:sx2]
-    if crop.size == 0:
-        return x1, y1, x2, y2
-
-    gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    gray    = clahe.apply(gray)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges   = cv2.Canny(blurred, 30, 100)
-    kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
-    edges   = cv2.dilate(edges, kernel, iterations=1)
-
-    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return x1, y1, x2, y2
-
-    alpr_cx = (x1 + x2) / 2.0
-    alpr_cy = (y1 + y2) / 2.0
-    alpr_area = float(bw * bh)
-
-    best_bbox = None
-    best_score = -1.0
-
-    for cnt in cnts:
-        area = cv2.contourArea(cnt)
-        # Must be at least 40% of ALPR area and not more than 4x
-        if area < alpr_area * 0.40 or area > alpr_area * 4.0:
-            continue
-
-        rx, ry, rw, rh = cv2.boundingRect(cnt)
-        if rh < 5 or rw < 10:
-            continue
-        aspect = rw / rh
-        if not (1.5 <= aspect <= 6.5):
-            continue
-
-        # Convert back to full-image coords
-        gx1 = rx + sx1; gy1 = ry + sy1
-        gx2 = gx1 + rw; gy2 = gy1 + rh
-
-        # Center must be near ALPR center
-        cx = (gx1 + gx2) / 2.0
-        cy = (gy1 + gy2) / 2.0
-        dist = ((cx - alpr_cx)**2 + (cy - alpr_cy)**2) ** 0.5
-        if dist > max(bw, bh) * 0.5:
-            continue
-
-        # Score: prefer aspect close to 3.33, penalize distance from center
-        aspect_score = 1.0 - abs(aspect - 3.33) / 3.33
-        dist_score   = 1.0 - dist / (max(bw, bh) * 0.5 + 1)
-        score        = aspect_score * 0.6 + dist_score * 0.4
-
-        if score > best_score:
-            best_score = score
-            best_bbox  = (gx1, gy1, gx2, gy2)
-
-    if best_bbox is not None:
-        gx1, gy1, gx2, gy2 = best_bbox
-        gw, gh = gx2 - gx1, gy2 - gy1
-        if gh > 0 and 1.8 <= gw / gh <= 6.0:
-            # Small fixed padding (3%) to ensure full coverage
-            pw = int(gw * 0.03); ph = int(gh * 0.03)
-            return (max(0, gx1 - pw), max(0, gy1 - ph),
-                    min(iw, gx2 + pw), min(ih, gy2 + ph))
-
-    # Fallback: ALPR box + small fixed padding (8%)
-    pw = int(bw * 0.08); ph = int(bh * 0.08)
-    return (max(0, x1 - pw), max(0, y1 - ph),
-            min(iw, x2 + pw), min(ih, y2 + ph))
+    return (
+        max(0,  x1 - pw),
+        max(0,  y1 - ph),
+        min(iw, x2 + pw),
+        min(ih, y2 + ph),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -476,46 +367,22 @@ def _expanded_bbox_quad(x1, y1, x2, y2, img_w, img_h):
 
 def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
     """
-    Step 0: Grow the ALPR bbox to true plate boundaries via color walk.
-    Step 1–5: 5-tier fallback contour/color detection on the grown crop.
-    All corners clamped to grown bbox before return.
+    Get the 4 plate corners using the ALPR bbox + small padding.
+
+    For straight-on shots (the vast majority of Indian car listing photos),
+    the ALPR bbox IS the plate rectangle — no contour/color detection needed.
+    Contour detection was causing oversized or mis-sized stickers.
 
     Returns np.float32 (4,2): [TL, TR, BR, BL].
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
-    # ── Step 0: Grow bbox to true plate ───────────────────────────────────
+    # Get padded bbox (tiny fixed padding only)
     gx1, gy1, gx2, gy2 = _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_hint)
 
-    # ── Crop from grown bbox (with tiny margin for contour detection) ──────
-    mx = min(8, max(0, int((gx2 - gx1) * 0.04)))
-    my = min(8, max(0, int((gy2 - gy1) * 0.04)))
-    cx1 = max(0,  gx1 - mx);  cy1 = max(0,  gy1 - my)
-    cx2 = min(iw, gx2 + mx);  cy2 = min(ih, gy2 + my)
-    crop = img[cy1:cy2, cx1:cx2]
-
-    bbox_area = float((gx2 - gx1) * (gy2 - gy1))
-
-    if crop.size > 0:
-        # ── Tier 1: contour-based ──────────────────────────────────────────
-        quad = _contour_quad(crop, cx1, cy1, bbox_area)
-        if quad is not None:
-            return _clamp_to_region(quad, gx1, gy1, gx2, gy2)
-
-        # ── Tier 2: color-based ────────────────────────────────────────────
-        quad = _color_quad(crop, cx1, cy1, bbox_area, plate_hint)
-        if quad is not None:
-            return _clamp_to_region(quad, gx1, gy1, gx2, gy2)
-
-        # ── Tier 3: minAreaRect on edge map ───────────────────────────────
-        quad = _minAreaRect_quad(crop, cx1, cy1, bbox_area)
-        if quad is not None:
-            return _clamp_to_region(quad, gx1, gy1, gx2, gy2)
-
-    # ── Tier 4: use grown bbox as perfect rectangle ────────────────────────
+    # Return as clean rectangle corners
     return _bbox_corners(gx1, gy1, gx2, gy2)
-    # Tier 5 (padded) used inside apply_logo_perspective if quad is degenerate
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -524,22 +391,19 @@ def find_plate_corners(img, x1, y1, x2, y2, plate_hint='white'):
 
 def _aspect_correct_corners(corners, bbox_w, bbox_h):
     """
-    For foreshortened (side-angle) plates: rescale quad height to match
-    standard plate aspect ratio along the plate's tilt axis.
-
-    FIX: Always attempt correction based on detected quad aspect ratio,
-    NOT bbox_aspect. Angled plates have large bbox_aspect but compressed
-    quad height — old check was incorrectly skipping correction.
+    Aspect correction for heavily angled/foreshortened plates.
+    Only applies when the plate appears severely compressed (aspect < 1.5).
+    For straight-on shots this returns corners unchanged.
     """
     plate_w, plate_h = _compute_plate_dims(corners)
     if plate_h < 1 or plate_w < 1:
         return corners
 
     detected_aspect = plate_w / plate_h
-    # Only correct when detected aspect is significantly below standard
-    # (means plate height is visually compressed due to angle)
-    if detected_aspect >= PLATE_STD_ASPECT * 0.75:
-        return corners  # quad already looks correct, no correction needed
+    # Only correct when VERY compressed (side-angle shots)
+    # Straight-on plates have aspect ~3.33, skip correction for those
+    if detected_aspect >= 1.5:
+        return corners  # straight-on shot, no correction needed
 
     target_h  = plate_w / PLATE_STD_ASPECT
     scale     = target_h / plate_h

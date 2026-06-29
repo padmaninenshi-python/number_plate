@@ -37,7 +37,7 @@ PAD_W_FRAC = 0.05
 PAD_H_FRAC = 0.10
 
 # Max outward expansion allowed when growing bbox (fraction of original bbox size)
-GROW_MAX_FRAC = 0.80   # can grow up to 80% outward on each side (needed for angled plates)
+GROW_MAX_FRAC = 0.30   # 30% max — prevents bleeding into white car body on white plates
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,17 +122,19 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
         # Yellow plate: vivid yellow range (broad to catch faded plates)
         mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
     else:
-        # White plate: low saturation, high value
-        white  = cv2.inRange(hsv, np.array([0,   0, 155]), np.array([180, 60, 255]))
-        # Also catch the faint yellow of older white plates
-        slight = cv2.inRange(hsv, np.array([14, 30, 140]), np.array([38, 120, 255]))
+        # White plate: tight high-saturation-free, very high brightness
+        # Key: plate has very low saturation (0-40) AND very high value (200+)
+        # Car body at angles has lower value due to lighting/curvature
+        white  = cv2.inRange(hsv, np.array([0,   0, 200]), np.array([180, 40, 255]))
+        # Slightly yellowish old plates — still tight saturation
+        slight = cv2.inRange(hsv, np.array([14, 20, 185]), np.array([38, 80, 255]))
         mask   = cv2.bitwise_or(white, slight)
 
     # Morphological closing to bridge gaps (border lines, reflections)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
 
-    MIN_PCT = 0.25   # scanline must have at least 25% plate color to keep growing
+    MIN_PCT = 0.55   # scanline must have at least 55% plate color to keep growing
 
     max_dx = int(bw * GROW_MAX_FRAC)
     max_dy = int(bh * GROW_MAX_FRAC)
@@ -193,10 +195,10 @@ def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
         else:
             break
 
-    # Sanity: grown box must still look like a plate (aspect 1.2–8.0)
+    # Sanity: grown box must still look like a plate (aspect 1.8–6.0)
     gw = new_x2 - new_x1
     gh = new_y2 - new_y1
-    if gh > 0 and 1.2 <= gw / gh <= 8.0:
+    if gh > 0 and 1.8 <= gw / gh <= 6.0:
         return (max(0, new_x1), max(0, new_y1),
                 min(iw, new_x2), min(ih, new_y2))
 
@@ -246,12 +248,14 @@ def _color_plate_mask(crop, plate_hint='white'):
     if plate_hint == 'yellow':
         mask = cv2.inRange(hsv, np.array([12, 70, 90]), np.array([40, 255, 255]))
     else:
-        white  = cv2.inRange(hsv, np.array([0,   0, 155]), np.array([180, 60, 255]))
-        slight = cv2.inRange(hsv, np.array([14, 30, 140]), np.array([38, 120, 255]))
+        # Tight white: very low saturation (plate number area is bright white)
+        # Avoid bleeding into white car body which has lower value at angles
+        white  = cv2.inRange(hsv, np.array([0,   0, 200]), np.array([180, 40, 255]))
+        slight = cv2.inRange(hsv, np.array([14, 20, 185]), np.array([38, 80, 255]))
         mask   = cv2.bitwise_or(white, slight)
 
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
     return mask
 

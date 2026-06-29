@@ -56,13 +56,9 @@ function stopCamera() {
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     const v = document.getElementById('videoEl');
     v.pause(); v.srcObject = null;
-    document.getElementById('placeholderIcon').textContent = '⏹';
-    document.getElementById('placeholderText').textContent = 'Camera stopped — click Start Camera to restart';
-    document.getElementById('placeholder').classList.remove('hidden');
-    document.getElementById('scanLine').classList.remove('active');
-    dis('btnStart', false); dis('btnStop', true);
     cameraActive = false;
-    _updateCaptureLock();
+    // Auto-refresh page after stop
+    window.location.reload();
 }
 
 function resumeCamera() {

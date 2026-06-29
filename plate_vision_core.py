@@ -33,8 +33,8 @@ PLATE_MIN_ASPECT  = 1.8
 QUAD_MIN_ASPECT = 1.0
 QUAD_MAX_ASPECT = 9.0
 
-PAD_W_FRAC = 0.05
-PAD_H_FRAC = 0.10
+PAD_W_FRAC = 0.0
+PAD_H_FRAC = 0.0
 
 # Max outward expansion allowed when growing bbox (fraction of original bbox size)
 GROW_MAX_FRAC = 0.30   # 30% max — prevents bleeding into white car body on white plates
@@ -98,35 +98,16 @@ def _compute_plate_dims(corners):
 
 def _grow_bbox_to_plate(img, x1, y1, x2, y2, plate_color):
     """
-    Return the plate boundary from the ALPR bbox.
-
-    KEY INSIGHT: ALPR (yolo-v9 license plate model) is already very accurate
-    for Indian plates. The old color/edge walk was OVER-EXPANDING and causing
-    the sticker to be too large.
-
-    NEW APPROACH:
-    - Trust the ALPR bbox as-is
-    - Add a tiny fixed padding (4% W, 6% H) to ensure full border coverage
-    - Yellow plates get slightly more padding (they can have thicker frames)
-    - No color walk, no edge walk — those caused the oversized sticker issue
+    Return ALPR bbox as-is — no padding, no expansion.
+    ALPR yolo-v9 is accurate enough; any padding causes oversized sticker.
     """
     ih, iw = img.shape[:2]
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-    bw = x2 - x1
-    bh = y2 - y1
-
-    if plate_color == 'yellow':
-        pw = int(bw * 0.06)
-        ph = int(bh * 0.08)
-    else:
-        pw = int(bw * 0.04)
-        ph = int(bh * 0.06)
-
     return (
-        max(0,  x1 - pw),
-        max(0,  y1 - ph),
-        min(iw, x2 + pw),
-        min(ih, y2 + ph),
+        max(0,  x1),
+        max(0,  y1),
+        min(iw, x2),
+        min(ih, y2),
     )
 
 
